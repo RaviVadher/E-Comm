@@ -1,6 +1,8 @@
 import React,{useState, useEffect} from "react";
 import Cards from "../../componant/Card";
 import axios from "axios";
+import { getProd } from "../../api/Api";
+import { Link } from "react-router-dom";
 
 interface Product{
     id:number;
@@ -23,9 +25,9 @@ export default function ProductList()
            
          try{
             console.log("fetch data")
-            const res = await axios.get("https://dummyjson.com/products");
-            console.log(res.data);
-             setProduct(res.data.products);
+            const res = await getProd();
+            console.log(res);
+             setProduct(res);
         }
         catch(err:any)
         {
@@ -53,12 +55,14 @@ export default function ProductList()
                ) : (
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
                      {product.map((item) => (
+                        <Link key={item.id} to={(`/shop/product/${item.id}`)}>
                         <Cards  key = {item.id}
                                id={item.id}
                                  name={item.title}
                                  category={item.category}
                                  price ={item.price}
                                  />
+                                 </Link>
                      ))}
                   </div>
                )}
