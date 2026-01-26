@@ -1,0 +1,221 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace HospitalManagementSystem
+{
+  
+    public class DoctorBusyException : Exception
+    {
+        public DoctorBusyException(string message) : base(message) { }
+    }
+
+    public class Doctor
+    {
+        public string Name { get; }
+        public string Specialization { get; }
+        public decimal ConsultationFee { get; }
+        public List<string> AvailableSlots { get; }
+
+        public Doctor(string name, string specialization, decimal fee, List<string> slots)
+        {
+            Name = name;
+            Specialization = specialization;
+            ConsultationFee = fee;
+            AvailableSlots = slots;
+        }
+
+        public bool IsAvailable(string time)
+        {
+            return AvailableSlots.Contains(time);
+        }
+
+        public void BookSlot(string time)
+        {
+            AvailableSlots.Remove(time);
+        }
+    }
+
+    public class Patient
+    {
+        public int PatientId { get; }
+        public string Name { get; }
+        public int Age { get; }
+        public List<string> MedicalHistory { get; }
+
+        public Patient(int id, string name, int age)
+        {
+            PatientId = id;
+            Name = name;
+            Age = age;
+            MedicalHistory = new List<string>();
+        }
+    }
+
+    public class Appointmentt
+    {
+        public string TicketId { get; }
+        public Doctor Doctor { get; }
+        public Patient Patient { get; }
+        public string Time { get; }
+        public bool IsCompleted { get; private set; }
+
+        public Appointmentt(Doctor doctor, Patient patient, string time)
+        {
+            TicketId = Guid.NewGuid().ToString().Substring(0, 8);
+            Doctor = doctor;
+            Patient = patient;
+            Time = time;
+            IsCompleted = false;
+        }
+
+        public void Complete()
+        {
+            IsCompleted = true;
+        }
+    }
+
+    public class MedicalRecord
+    {
+        public string Diagnosis { get; }
+        public string Treatment { get; }
+
+        public MedicalRecord(string diagnosis, string treatment)
+        {
+            Diagnosis = diagnosis;
+            Treatment = treatment;
+        }
+    }
+
+    public class Billing
+    {
+        public static decimal GenerateBill(decimal consultationFee, decimal tests, decimal treatments)
+        {
+            return consultationFee + tests + treatments;
+        }
+    }
+
+    // Hospital Service
+    public class HospitalService
+    {
+        private List<Doctor> doctors = new();
+        private List<Appointmentt> appointments = new();
+
+        public void AddDoctor(Doctor doctor)
+        {
+            doctors.Add(doctor);
+        }
+
+        public Appointmentt BookByDoctorName(string doctorName, Patient patient, string time)
+        {
+            Doctor doctor = doctors.FirstOrDefault(d => d.Name == doctorName);
+
+            if (doctor == null)
+                throw new Exception("Doctor is not fund");
+
+            if (!doctor.IsAvailable(time))
+                throw new DoctorBusyException($"Doctor busy at {time}. Available slots: {string.Join(", ", doctor.AvailableSlots)}");
+
+            doctor.BookSlot(time);
+            Appointmentt appointment = new Appointmentt(doctor, patient, time);
+            appointments.Add(appointment);
+
+            PrintTicket(appointment);
+            return appointment;
+        }
+
+        public Appointmentt BookBySpecialization(string specialization, Patient patient, string time)
+        {
+            var availableDoctor = doctors
+                .Where(d => d.Specialization == specialization && d.IsAvailable(time))
+                .FirstOrDefault();
+
+            if (availableDoctor == null)
+            {
+                var nextAvailable = doctors
+                    .Where(d => d.Specialization == specialization)
+                    .SelectMany(d => d.AvailableSlots.Select(slot => $"{d.Name} - {slot}"))
+                    .FirstOrDefault();
+
+                throw new DoctorBusyException($"No doctor available at {time}. Next available: {nextAvailable}");
+            }
+
+            availableDoctor.BookSlot(time);
+            Appointmentt appointment = new Appointmentt(availableDoctor, patient, time);
+            appointments.Add(appointment);
+
+            PrintTicket(appointment);
+            return appointment;
+        }
+
+        public void CompleteAppointment(Appointmentt appointment, string diagnosis, string treatment)
+        {
+            appointment.Complete();
+            appointment.Patient.MedicalHistory.Add(diagnosis);
+
+            MedicalRecord record = new MedicalRecord(diagnosis, treatment);
+
+            decimal bill = Billing.GenerateBill(
+                appointment.Doctor.ConsultationFee,
+                tests: 500,
+                treatments: 1000
+            );
+
+            Console.WriteLine("\n_____Appointment Complete_____");
+            Console.WriteLine($"Patient: {appointment.Patient.Name}");
+            Console.WriteLine($"Doctor: {appointment.Doctor.Name}");
+            Console.WriteLine($"Diagnosis: {record.Diagnosis}");
+            Console.WriteLine($"Treatment: {record.Treatment}");
+            Console.WriteLine($"Final Invoice: ₹{bill}");
+        }
+
+        public void PrintAllAppointments()
+        {
+            Console.WriteLine("\n_____All Appointments_____");
+            foreach (var app in appointments)
+            {
+                Console.WriteLine($"Ticket: {app.TicketId}, Doctor: {app.Doctor.Name}, Patient: {app.Patient.Name}, Time: {app.Time}");
+            }
+        }
+
+        private void PrintTicket(Appointmentt appointment)
+        {
+            Console.WriteLine("\n--- Appointment Confirmed ---");
+            Console.WriteLine($"Ticket ID: {appointment.TicketId}");
+            Console.WriteLine($"Doctor: {appointment.Doctor.Name}");
+            Console.WriteLine($"Time: {appointment.Time}");
+            Console.WriteLine($"Fee: ₹{appointment.Doctor.ConsultationFee}");
+        }
+    }
+
+    // Program
+    class Program
+    {
+        static void Main()
+        {
+            HospitalService hospital = new HospitalService();
+
+            hospital.AddDoctor(new Doctor("Dr. Shah", "Cardiologist", 1500, new List<string> { "10:00 AM", "11:00 AM" }));
+            hospital.AddDoctor(new Doctor("Dr. kiran", "Dermatologist", 1000, new List<string> { "10:00 AM", "12:00 PM" }));
+            hospital.AddDoctor(new Doctor("Dr. Lakhan", "Cardiologist", 1800, new List<string> { "11:00 AM", "01:00 PM" }));
+
+            Patient p1 = new Patient(1, "Amit", 30);
+            Patient p2 = new Patient(2, "Riya", 25);
+
+            try
+            {
+                var app1 = hospital.BookByDoctorName("Dr. Shah", p1, "10:00 AM");
+                var app2 = hospital.BookBySpecialization("Cardiologist", p2, "11:00 AM");
+
+                hospital.PrintAllAppointments();
+
+                hospital.CompleteAppointment(app1, "High BP", "Medication & Lifestyle Change");
+                hospital.CompleteAppointment(app2, "Chest Pain", "ECG & Medication");
+            }
+            catch (DoctorBusyException ex)
+            {
+                Console.WriteLine($"Booking Error: {ex.Message}");
+            }
+        }
+    }
+}
