@@ -1,221 +1,537 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
+# HRMS Internship — Detailed Design Deliverable
 
-namespace HospitalManagementSystem
+**Contents**
+
+1. Executive summary
+2. Data model / ER (tables, relationships)
+3. SQL DDL (Postgres-flavored create statements)
+4. Key business rules & validations
+5. REST API design (endpoints + request/response samples)
+6. Scheduling logic for games (round-robin / fair queue) + pseudocode
+7. UI flows / wireframe descriptions for major screens
+8. Additional notes: notifications, permissions, indexing, testing
+
+---
+
+## 1 — Executive summary
+
+This document defines a full-stack-ready design for the HRMS internship assignment covering Travel & Expense, Social Achievements, Games Scheduling (pool/chess/foosball), Org Chart, and Jobs & Referrals. It includes a normalized Postgres-friendly schema, SQL DDL, API endpoints (CRUD + actions), UI flows/wireframes, and a fair scheduling algorithm (queue-based round-robin) that ensures each interested player gets a slot before repeats.
+
+Scope focuses on correctness, role-based access control (Employee / Manager / HR), auditability, server-side validation, and clear separation of concerns.
+
+---
+
+## 2 — Data model (ER overview)
+
+Primary entities:
+
+* `users` (employees + managers + HR) + `roles`
+* `departments`
+* `travels` and `travel_assignments` (many-to-many travel↔employee)
+* `documents` (generic for travels, expenses, jobs)
+* `expenses` + `expense_proofs`
+* `achievements` (posts), `likes`, `comments`
+* `games` (pool/chess/foosball), `game_config`, `game_interests`, `slots`, `bookings`, `booking_participants`, `booking_queue`
+* `jobs`, `job_shares`, `referrals`
+* `notifications`, `audit_logs`
+
+Key relationships:
+
+* `users.manager_id` → `users.id` (self-referencing)
+* `travel_assignments` links `travels` and `users`
+* `documents` link to `travel` or `expense` or `job` via polymorphic fields (`owner_type`, `owner_id`)
+* `expenses` must reference `travel_assignments` (or `travel_id` + `employee_id`) to assert belonging
+* `bookings` reference `slots`; `booking_participants` link users to bookings; `booking_queue` tracks waiting order
+
+Diagram (textual):
+
+```
+users --< travel_assignments >-- travels
+users --< expenses >-- travels
+travels --< documents
+expenses --< expense_proofs (documents)
+achievements --< comments
+achievements --< likes
+games --< game_config
+games --< slots --< bookings --< booking_participants
+slots -- generated from game_config daily
+booking_queue table maintains FIFO with cycle counters for fairness
+```
+
+---
+
+## 3 — SQL DDL (Spring Boot / JPA-optimized, Postgres)
+
+> This section revises the schema to be **fully normalized**, **JPA/Hibernate-friendly**, and production-safe for a Spring Boot application.
+
+### Key changes from earlier draft
+
+* Removed polymorphic foreign keys where possible (JPA limitation)
+* Introduced **join tables** instead of owner_type/owner_id pattern
+* Replaced ENUM types with lookup tables (better for JPA portability)
+* Added surrogate IDs + proper unique constraints
+* Clear parent–child ownership for cascading
+
+---
+
+### 3.1 Core reference tables
+
+```sql
+CREATE TABLE roles (
+  id BIGSERIAL PRIMARY KEY,
+  code VARCHAR(32) UNIQUE NOT NULL -- EMPLOYEE, MANAGER, HR, ADMIN
+);
+
+CREATE TABLE departments (
+  id BIGSERIAL PRIMARY KEY,
+  name VARCHAR(128) UNIQUE NOT NULL
+);
+```
+
+---
+
+### 3.2 Users / Employees (Org chart backbone)
+
+```sql
+CREATE TABLE users (
+  id BIGSERIAL PRIMARY KEY,
+  employee_code VARCHAR(32) UNIQUE NOT NULL,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  full_name VARCHAR(200) NOT NULL,
+  role_id BIGINT NOT NULL REFERENCES roles(id),
+  manager_id BIGINT REFERENCES users(id),
+  department_id BIGINT REFERENCES departments(id),
+  designation VARCHAR(128),
+  date_of_birth DATE,
+  date_of_joining DATE,
+  avatar_url VARCHAR(512),
+  active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_users_manager ON users(manager_id);
+```
+
+---
+
+### 3.3 Travel module
+
+```sql
+CREATE TABLE travels (
+  id BIGSERIAL PRIMARY KEY,
+  title VARCHAR(255) NOT NULL,
+  description TEXT,
+  start_date DATE NOT NULL,
+  end_date DATE NOT NULL,
+  origin VARCHAR(128),
+  destination VARCHAR(128),
+  created_by BIGINT REFERENCES users(id),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE travel_assignments (
+  id BIGSERIAL PRIMARY KEY,
+  travel_id BIGINT NOT NULL REFERENCES travels(id) ON DELETE CASCADE,
+  employee_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  UNIQUE (travel_id, employee_id)
+);
+```
+
+---
+
+### 3.4 Documents (normalized ownership)
+
+```sql
+CREATE TABLE documents (
+  id BIGSERIAL PRIMARY KEY,
+  file_name VARCHAR(255) NOT NULL,
+  file_path VARCHAR(512) NOT NULL,
+  content_type VARCHAR(128),
+  uploaded_by BIGINT REFERENCES users(id),
+  uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE travel_documents (
+  id BIGSERIAL PRIMARY KEY,
+  travel_id BIGINT REFERENCES travels(id) ON DELETE CASCADE,
+  document_id BIGINT REFERENCES documents(id) ON DELETE CASCADE,
+  owner_role VARCHAR(16) CHECK (owner_role IN ('HR','EMPLOYEE'))
+);
+```
+
+---
+
+### 3.5 Expense module (fully normalized)
+
+```sql
+CREATE TABLE expense_statuses (
+  id SMALLINT PRIMARY KEY,
+  code VARCHAR(32) UNIQUE NOT NULL -- DRAFT, SUBMITTED, APPROVED, REJECTED
+);
+
+CREATE TABLE expenses (
+  id BIGSERIAL PRIMARY KEY,
+  travel_id BIGINT NOT NULL REFERENCES travels(id),
+  employee_id BIGINT NOT NULL REFERENCES users(id),
+  expense_date DATE NOT NULL,
+  category VARCHAR(64) NOT NULL,
+  amount NUMERIC(12,2) NOT NULL,
+  status_id SMALLINT REFERENCES expense_statuses(id),
+  hr_remarks TEXT,
+  submitted_at TIMESTAMP,
+  actioned_by BIGINT REFERENCES users(id),
+  actioned_at TIMESTAMP
+);
+
+CREATE TABLE expense_documents (
+  id BIGSERIAL PRIMARY KEY,
+  expense_id BIGINT REFERENCES expenses(id) ON DELETE CASCADE,
+  document_id BIGINT REFERENCES documents(id) ON DELETE CASCADE,
+  UNIQUE (expense_id, document_id)
+);
+```
+
+---
+
+### 3.6 Achievements / Social feed
+
+```sql
+CREATE TABLE achievement_posts (
+  id BIGSERIAL PRIMARY KEY,
+  author_id BIGINT REFERENCES users(id),
+  title VARCHAR(255),
+  description TEXT,
+  system_generated BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE achievement_tags (
+  id BIGSERIAL PRIMARY KEY,
+  name VARCHAR(64) UNIQUE
+);
+
+CREATE TABLE achievement_post_tags (
+  post_id BIGINT REFERENCES achievement_posts(id) ON DELETE CASCADE,
+  tag_id BIGINT REFERENCES achievement_tags(id) ON DELETE CASCADE,
+  PRIMARY KEY (post_id, tag_id)
+);
+
+CREATE TABLE achievement_likes (
+  post_id BIGINT REFERENCES achievement_posts(id) ON DELETE CASCADE,
+  user_id BIGINT REFERENCES users(id),
+  PRIMARY KEY (post_id, user_id)
+);
+
+CREATE TABLE achievement_comments (
+  id BIGSERIAL PRIMARY KEY,
+  post_id BIGINT REFERENCES achievement_posts(id) ON DELETE CASCADE,
+  author_id BIGINT REFERENCES users(id),
+  comment TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+---
+
+### 3.7 Games & fair scheduling
+
+```sql
+CREATE TABLE games (
+  id BIGSERIAL PRIMARY KEY,
+  code VARCHAR(32) UNIQUE NOT NULL
+);
+
+CREATE TABLE game_interest (
+  user_id BIGINT REFERENCES users(id),
+  game_id BIGINT REFERENCES games(id),
+  PRIMARY KEY (user_id, game_id)
+);
+
+CREATE TABLE game_slots (
+  id BIGSERIAL PRIMARY KEY,
+  game_id BIGINT REFERENCES games(id),
+  slot_start TIMESTAMP,
+  slot_end TIMESTAMP,
+  max_players INT
+);
+
+CREATE TABLE game_bookings (
+  id BIGSERIAL PRIMARY KEY,
+  slot_id BIGINT REFERENCES game_slots(id),
+  created_by BIGINT REFERENCES users(id),
+  status VARCHAR(16),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE game_booking_players (
+  booking_id BIGINT REFERENCES game_bookings(id) ON DELETE CASCADE,
+  user_id BIGINT REFERENCES users(id),
+  PRIMARY KEY (booking_id, user_id)
+);
+
+CREATE TABLE game_queue (
+  id BIGSERIAL PRIMARY KEY,
+  game_id BIGINT REFERENCES games(id),
+  user_id BIGINT REFERENCES users(id),
+  completed_slots INT DEFAULT 0,
+  UNIQUE (game_id, user_id)
+);
+```
+
+---
+
+### 3.8 Jobs & referrals
+
+```sql
+CREATE TABLE jobs (
+  id BIGSERIAL PRIMARY KEY,
+  title VARCHAR(255),
+  description TEXT,
+  hr_email VARCHAR(255),
+  active BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE job_shares (
+  id BIGSERIAL PRIMARY KEY,
+  job_id BIGINT REFERENCES jobs(id),
+  shared_by BIGINT REFERENCES users(id),
+  email VARCHAR(255),
+  shared_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE referrals (
+  id BIGSERIAL PRIMARY KEY,
+  job_id BIGINT REFERENCES jobs(id),
+  referred_by BIGINT REFERENCES users(id),
+  friend_name VARCHAR(255),
+  friend_email VARCHAR(255),
+  cv_document_id BIGINT REFERENCES documents(id),
+  status VARCHAR(32),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+---
+
+## 4 — Key business rules & validations (server-side)
+
+* **RBAC**: Roles table + `role_id` on users. Frontend shows/hides actions; backend enforces checks on each endpoint.
+* **Travel assignment notifications**: When HR creates a travel and assigns employees (in travel_assignments), send an email to each employee + create a `notifications` row.
+* **Expense submission window**: Employee may create expenses only if `expense_date >= travel.start_date` and `expense_date <= travel.end_date + 10 days` for submission. Backend returns `400` with clear message if violated.
+* **Expense proof**: At least one linked `expense_proofs` required to transition from `draft` to `submitted`. If no proof, reject submission with error.
+* **Expense approval**: HR changes status to `approved` or `rejected`. Rejection requires non-empty `hr_remarks`.
+* **Validation rules**: Stored in `expense_validation_rules.json_config`, e.g. `{"max_per_day": 5000, "required_categories": ["travel","meals"]}`. Apply for new submissions.
+* **One active booking per employee per day**: Enforced at booking creation time — check existing bookings with status `booked` on that calendar day.
+* **Fairness**: Use `booking_queue.completed_slots_in_cycle` counts to prioritize users with fewer completed slots.
+* **Auto system posts**: Cron job / scheduled worker runs daily to check birthdays and anniversaries and creates `achievements` with `is_system=true`.
+
+---
+
+## 5 — REST API design (selected endpoints)
+
+General notes:
+
+* All endpoints under `/api/v1`.
+* Use JWT for auth header `Authorization: Bearer <token>`.
+* Responses use `{ success: bool, data: ..., errors?: ... }`.
+* File upload endpoints accept `multipart/form-data` and return `documents` record.
+
+### Auth
+
+`POST /api/v1/auth/login`
+Request: `{ "email": "x", "password": "x" }`
+Response: `{ success: true, data: { token: "...", user: { id, full_name, email, role_id } }}`
+
+### Users
+
+`GET /api/v1/users/:id` — returns profile incl. DOB, DOJ, manager, department.
+
+### Travels
+
+`POST /api/v1/travels` — HR only. Body: `{ title, description, start_date, end_date, origin, destination, assigned_employee_ids: [] }`.
+Behavior: creates `travels` and `travel_assignments` rows; creates notifications and sends emails.
+
+`GET /api/v1/travels/:id` — returns travel + assigned employees + documents list.
+
+`POST /api/v1/travels/:id/documents` — upload doc; sets owner_type='travel', owner_id=travel.id.
+
+### Expenses
+
+`POST /api/v1/expenses` — create expense (draft)
+Request body: `{ travel_id, employee_id, expense_date, amount, currency, category, description }`
+Server-side: validate travel assignment and expense_date window. Return `400` with message if invalid.
+
+`POST /api/v1/expenses/:id/proofs` — upload proof document and link via `expense_proofs`.
+
+`POST /api/v1/expenses/:id/submit` — action endpoint to move `draft` -> `submitted`.
+Server checks: at least one proof linked, expense_date in allowed window, validation rules satisfied. On success set `status='submitted'`, `submitted_at=now()`, create notification to HR and send configured HR mailbox email.
+
+`POST /api/v1/expenses/:id/approve` — HR only. Body: `{ action: 'approve'|'reject', remark?: string }`.
+On approve: set `status='approved'`, `approved_at`, `approved_by` and log an audit.
+On reject: require `remark` non-empty; set `status='rejected'` and `rejected_at`, `rejected_by`.
+
+`GET /api/v1/expenses?employee_id=&status=&from=&to=&travel_id=` — filterable list for HR.
+
+### Achievements (social)
+
+`GET /api/v1/achievements?tag=&author=&from=&to=` — listing, reverse chrono, paged.
+`POST /api/v1/achievements` — create post. `is_system` only allowed for backend scheduled jobs or HR with special permission.
+`POST /api/v1/achievements/:id/like` — toggles like for current user (creates `achievement_likes`).
+`POST /api/v1/achievements/:id/comment` — add comment.
+`DELETE /api/v1/achievements/:id` — author or HR can delete. If HR deletes, create a warning email to author and an audit_log entry.
+
+### Games & Slots
+
+`GET /api/v1/games/:game_key/slots?date=YYYY-MM-DD` — returns generated slots for date (the server may lazily generate slots or pre-generate daily).
+`POST /api/v1/games/:game_key/book` — body: `{ slot_id, participant_ids: [uuid,...] }` (participant_ids max = config.max_players_per_slot - 1; host is current user). Server checks: all participants are `is_interested` in the game, none has another active booking that day, booking fairness enforced by queue.
+`POST /api/v1/games/:game_key/cancel` — body `{ booking_id }`.
+`GET /api/v1/games/:game_key/queue` — returns queue status and completed counts (HR/admin only).
+
+### Jobs & Referrals
+
+`GET /api/v1/jobs` — list open jobs.
+`POST /api/v1/jobs/:id/share` — body: `{ emails: [..] }` -> validates email, creates `job_shares` rows and sends email with JD attached via documents[jd_document_id].
+`POST /api/v1/jobs/:id/refer` — body: `{ friend_name, friend_email, note, cv_document_id }` -> create `referrals` record, notify job HR owner and CV reviewers.
+
+### Notifications
+
+`GET /api/v1/notifications` — list; `POST /api/v1/notifications/mark-read` to mark read.
+
+---
+
+## 6 — Scheduling logic for games (fair round-robin / queue)
+
+### Goals
+
+* Fairness: everyone who is interested gets one slot before anyone gets a second in the same cycle.
+* Respect per-day single active booking constraint.
+* Handle cancellations by promoting next eligible queue member.
+
+### Design
+
+* Maintain `booking_queue` rows per game with `completed_slots_in_cycle` integer and `cycle_id` marking the current allocation cycle.
+* Periodically (or on-demand when generating slots for a day), compute a cycle order as follows:
+
+  * For all interested players with `is_interested=true` and active=true, fetch `completed_slots_in_cycle` and `enqueued_at`.
+  * Sort ascending by `completed_slots_in_cycle` then by `enqueued_at` (FIFO among equals).
+  * Allocate slots sequentially by picking the first `max_players_per_slot` users for each slot, and increment their `completed_slots_in_cycle`.
+  * When every interested player has `completed_slots_in_cycle >= 1`, a new cycle begins: reset `completed_slots_in_cycle=0` and new `cycle_id` generated (or increment cycle counter) and repeat.
+
+### Pseudocode (simplified)
+
+```
+function allocate_slots(game_id, date):
+  config = get_game_config(game_id)
+  slots = generate_slots_for_date(game_id, date, config)
+  queue = SELECT * FROM booking_queue WHERE game_id=... ORDER BY completed_slots_in_cycle ASC, enqueued_at ASC
+  index = 0
+  for slot in slots:
+    participants = []
+    while len(participants) < config.max_players_per_slot and index < queue.length:
+      candidate = queue[index]
+      if user_has_booking_on_date(candidate.user_id, date):
+        index += 1; continue
+      participants.append(candidate.user_id)
+      candidate.completed_slots_in_cycle += 1
+      index += 1
+    if participants.length > 0:
+      create_booking(slot.id, host=participants[0], participants)
+      mark slot is_available=false
+  if index >= queue.length and some players have completed_slots_in_cycle==0: start new cycle (reset counts) and re-run
+```
+
+### Cancellation handling
+
+* When a participant cancels, release their spot: if slot is still in future, find next eligible user in `booking_queue` who does not have an active booking that day and assign them; send email to all participants and add private calendar events for new participant.
+
+### Edge cases
+
+* Less interested players than available slots: some slots stay unfilled; optionally allow open booking to others or repeat players by allowing second pass when queue exhausted.
+* Late cancellations: if within a configured threshold (e.g., 1 hour before slot start), either leave vacancy or allow immediate walk-in handling.
+
+---
+
+## 7 — UI flows / Wireframes (textual)
+
+**Navigation**: Left nav: Travel & Expenses, Achievements, Games, Org Chart, Jobs & Referrals, My Profile, Admin (HR)
+
+### Travel & Expense screen (Employee)
+
+* Travel list (cards) showing travel title, dates, status, assigned by.
+* Click travel → travel detail panel with tabs: Overview | Documents | Expenses
+
+  * Overview: travel info and contact HR button.
+  * Documents: list, upload button (only for own travel docs). Clicking document previews in modal.
+  * Expenses: 'Add Expense' button (opens form) — fields: date (calendar limited to travel dates), amount, category (dropdown), description, upload proof (required). Submit saves as draft; Submit for Approval button triggers validation and email to HR.
+
+### Travel & Expense screen (HR)
+
+* Travel create modal with multi-select employees. On save: confirmation modal summarizing recipients and 'Send notifications' checkbox.
+* Expense management screen: filter bar (employee, travel, date range, status). Table with actions: view detail (preview proofs), Approve/Reject (modal to add remarks). Bulk export CSV.
+
+### Achievements feed
+
+* Feed shows post card: author avatar, title, body, tags, like button (with count), comment count. Inline comment composer. Small button to create new post (Modal). HR-only actions available on post: delete.
+* Celebrations: special system post styling (badge: System Post) auto-generated for birthdays/anniversaries.
+
+### Games booking (Pool) — Employee flow
+
+* Games landing: select game (pool), shows today/tomorrow slots timeline. Toggle to show only slots for interested players.
+* Book slot modal: choose participants (auto-suggest from team), checks 1 active booking/day constraint; on submit: send emails + create private calendar invites (ICS per participant).
+* My bookings page: list of upcoming bookings with cancel button.
+
+### Org Chart
+
+* Search box at top.
+* When user clicked: show vertical chain from CEO → ... → manager → selected employee at left and a horizontal list of direct reports (card list) at right. Clicking any node reloads.
+* Node shows avatar, name, title, contact, 'View profile' button.
+
+### Jobs & Referral
+
+* Jobs list: card with title, summary, Share Job and Refer Friend buttons.
+* Share job modal: text input for email(s), validate on submit, create job_shares and send mail.
+* Refer friend modal: friend name, email, upload CV (required), optional note. On submit: store referral, attach CV document, send emails to job HR owner and configured reviewers.
+
+---
+
+## 8 — Additional notes
+
+* **Notifications & Email**: Use an event-driven worker (e.g., RabbitMQ/Kafka + worker) to send emails and create in-app notifications asynchronously on actions like travel create, expense submit, booking confirm, referral.
+* **Storage**: Use object storage (S3/GCS) for `documents.file_path`. Keep thumbnails / previews for images.
+* **Authentication**: JWT with refresh tokens or session cookies. Multi-tenant not required.
+* **Testing**: Provide unit tests for expense window enforcement, proof requirement, booking fairness algorithm, referral emails.
+* **Monitoring**: Log audit entries for approvals, deletes (HR deletes social content), and other sensitive actions.
+
+---
+
+## Appendix — Example JSON snippets
+
+**Expense submission response on error**
+
+```json
 {
-  
-    public class DoctorBusyException : Exception
-    {
-        public DoctorBusyException(string message) : base(message) { }
-    }
-
-    public class Doctor
-    {
-        public string Name { get; }
-        public string Specialization { get; }
-        public decimal ConsultationFee { get; }
-        public List<string> AvailableSlots { get; }
-
-        public Doctor(string name, string specialization, decimal fee, List<string> slots)
-        {
-            Name = name;
-            Specialization = specialization;
-            ConsultationFee = fee;
-            AvailableSlots = slots;
-        }
-
-        public bool IsAvailable(string time)
-        {
-            return AvailableSlots.Contains(time);
-        }
-
-        public void BookSlot(string time)
-        {
-            AvailableSlots.Remove(time);
-        }
-    }
-
-    public class Patient
-    {
-        public int PatientId { get; }
-        public string Name { get; }
-        public int Age { get; }
-        public List<string> MedicalHistory { get; }
-
-        public Patient(int id, string name, int age)
-        {
-            PatientId = id;
-            Name = name;
-            Age = age;
-            MedicalHistory = new List<string>();
-        }
-    }
-
-    public class Appointmentt
-    {
-        public string TicketId { get; }
-        public Doctor Doctor { get; }
-        public Patient Patient { get; }
-        public string Time { get; }
-        public bool IsCompleted { get; private set; }
-
-        public Appointmentt(Doctor doctor, Patient patient, string time)
-        {
-            TicketId = Guid.NewGuid().ToString().Substring(0, 8);
-            Doctor = doctor;
-            Patient = patient;
-            Time = time;
-            IsCompleted = false;
-        }
-
-        public void Complete()
-        {
-            IsCompleted = true;
-        }
-    }
-
-    public class MedicalRecord
-    {
-        public string Diagnosis { get; }
-        public string Treatment { get; }
-
-        public MedicalRecord(string diagnosis, string treatment)
-        {
-            Diagnosis = diagnosis;
-            Treatment = treatment;
-        }
-    }
-
-    public class Billing
-    {
-        public static decimal GenerateBill(decimal consultationFee, decimal tests, decimal treatments)
-        {
-            return consultationFee + tests + treatments;
-        }
-    }
-
-    // Hospital Service
-    public class HospitalService
-    {
-        private List<Doctor> doctors = new();
-        private List<Appointmentt> appointments = new();
-
-        public void AddDoctor(Doctor doctor)
-        {
-            doctors.Add(doctor);
-        }
-
-        public Appointmentt BookByDoctorName(string doctorName, Patient patient, string time)
-        {
-            Doctor doctor = doctors.FirstOrDefault(d => d.Name == doctorName);
-
-            if (doctor == null)
-                throw new Exception("Doctor is not fund");
-
-            if (!doctor.IsAvailable(time))
-                throw new DoctorBusyException($"Doctor busy at {time}. Available slots: {string.Join(", ", doctor.AvailableSlots)}");
-
-            doctor.BookSlot(time);
-            Appointmentt appointment = new Appointmentt(doctor, patient, time);
-            appointments.Add(appointment);
-
-            PrintTicket(appointment);
-            return appointment;
-        }
-
-        public Appointmentt BookBySpecialization(string specialization, Patient patient, string time)
-        {
-            var availableDoctor = doctors
-                .Where(d => d.Specialization == specialization && d.IsAvailable(time))
-                .FirstOrDefault();
-
-            if (availableDoctor == null)
-            {
-                var nextAvailable = doctors
-                    .Where(d => d.Specialization == specialization)
-                    .SelectMany(d => d.AvailableSlots.Select(slot => $"{d.Name} - {slot}"))
-                    .FirstOrDefault();
-
-                throw new DoctorBusyException($"No doctor available at {time}. Next available: {nextAvailable}");
-            }
-
-            availableDoctor.BookSlot(time);
-            Appointmentt appointment = new Appointmentt(availableDoctor, patient, time);
-            appointments.Add(appointment);
-
-            PrintTicket(appointment);
-            return appointment;
-        }
-
-        public void CompleteAppointment(Appointmentt appointment, string diagnosis, string treatment)
-        {
-            appointment.Complete();
-            appointment.Patient.MedicalHistory.Add(diagnosis);
-
-            MedicalRecord record = new MedicalRecord(diagnosis, treatment);
-
-            decimal bill = Billing.GenerateBill(
-                appointment.Doctor.ConsultationFee,
-                tests: 500,
-                treatments: 1000
-            );
-
-            Console.WriteLine("\n_____Appointment Complete_____");
-            Console.WriteLine($"Patient: {appointment.Patient.Name}");
-            Console.WriteLine($"Doctor: {appointment.Doctor.Name}");
-            Console.WriteLine($"Diagnosis: {record.Diagnosis}");
-            Console.WriteLine($"Treatment: {record.Treatment}");
-            Console.WriteLine($"Final Invoice: ₹{bill}");
-        }
-
-        public void PrintAllAppointments()
-        {
-            Console.WriteLine("\n_____All Appointments_____");
-            foreach (var app in appointments)
-            {
-                Console.WriteLine($"Ticket: {app.TicketId}, Doctor: {app.Doctor.Name}, Patient: {app.Patient.Name}, Time: {app.Time}");
-            }
-        }
-
-        private void PrintTicket(Appointmentt appointment)
-        {
-            Console.WriteLine("\n--- Appointment Confirmed ---");
-            Console.WriteLine($"Ticket ID: {appointment.TicketId}");
-            Console.WriteLine($"Doctor: {appointment.Doctor.Name}");
-            Console.WriteLine($"Time: {appointment.Time}");
-            Console.WriteLine($"Fee: ₹{appointment.Doctor.ConsultationFee}");
-        }
-    }
-
-    // Program
-    class Program
-    {
-        static void Main()
-        {
-            HospitalService hospital = new HospitalService();
-
-            hospital.AddDoctor(new Doctor("Dr. Shah", "Cardiologist", 1500, new List<string> { "10:00 AM", "11:00 AM" }));
-            hospital.AddDoctor(new Doctor("Dr. kiran", "Dermatologist", 1000, new List<string> { "10:00 AM", "12:00 PM" }));
-            hospital.AddDoctor(new Doctor("Dr. Lakhan", "Cardiologist", 1800, new List<string> { "11:00 AM", "01:00 PM" }));
-
-            Patient p1 = new Patient(1, "Amit", 30);
-            Patient p2 = new Patient(2, "Riya", 25);
-
-            try
-            {
-                var app1 = hospital.BookByDoctorName("Dr. Shah", p1, "10:00 AM");
-                var app2 = hospital.BookBySpecialization("Cardiologist", p2, "11:00 AM");
-
-                hospital.PrintAllAppointments();
-
-                hospital.CompleteAppointment(app1, "High BP", "Medication & Lifestyle Change");
-                hospital.CompleteAppointment(app2, "Chest Pain", "ECG & Medication");
-            }
-            catch (DoctorBusyException ex)
-            {
-                Console.WriteLine($"Booking Error: {ex.Message}");
-            }
-        }
-    }
+  "success": false,
+  "errors": ["Expense date 2026-02-15 is outside allowable window (2026-01-30 to 2026-02-05)" ]
 }
+```
+
+**Booking success**
+
+```json
+{
+  "success": true,
+  "data": { "booking_id": "...", "slot_id": "...", "participants": [ {"id":"...", "name":"A"}, ... ] }
+}
+```
+
+---
+
+If you'd like, I can:
+
+* produce a downloadable SQL file with the DDL from section 3;
+* generate a PNG SVG of the ER diagram;
+* convert the REST API into an OpenAPI (Swagger) spec;
+* produce simple clickable wireframes (Figma-like frames) as images.
+
+Tell me which export you want and I will generate it next.
